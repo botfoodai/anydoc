@@ -1,0 +1,105 @@
+name: Publish @botfoodai/anydoc-wasm
+
+# Bot Food fork only: publishes the wasm binding to GitHub Packages as
+# @botfoodai/anydoc-wasm. Upstream's release.yml (disabled here) publishes
+# under @firecrawl; this file has no upstream counterpart, so rebasing onto
+# upstream never conflicts with it.
+#
+# To release, tag a commit on main that ci.yml has passed on, named
+# anydoc-wasm-v<crate version>-botfood.<n>, for example:
+#
+#   git tag anydoc-wasm-v0.2.4-botfood.1 && git push origin anydoc-wasm-v0.2.4-botfood.1
+#
+# The crate version comes from wasm/Cargo.toml, so the fork's manifests stay
+# as upstream has them; only the published package carries the -botfood.<n>
+# suffix and this repository's URL.
+
+on:
+  push:
+    tags: ['anydoc-wasm-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # Fails in seconds on a wrong tag, before anything is built.
+  check:
+    name: Tag names the crate version, on main, CI passed
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      actions: read # the ci.yml runs for the tagged commit
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # Every branch, so origin/main is present for the ancestry check.
+          fetch-depth: 0
+      - id: version
+        name: Tag names wasm/Cargo.toml's version with a -botfood.<n> suffix
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' wasm/Cargo.toml | head -n 1)"
+          version="${GITHUB_REF_NAME#anydoc-wasm-v}"
+          if ! [[ "$version" =~ ^${crate//./\\.}-botfood\.[0-9]+$ ]]; then
+            echo "Tag $GITHUB_REF_NAME doesn't name the crate version; expected anydoc-wasm-v$crate-botfood.<n>."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Only code that was reviewed and merged is published, never a tag on an unmerged branch.
+      - name: Tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Tag $GITHUB_REF_NAME is on a commit that isn't on main."
+            exit 1
+          fi
+      # The same checks as every pull request, already run on this commit when it reached main.
+      - name: ci.yml passed on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" --jq '.total_count')"
+          if [ "$passed" = "0" ]; then
+            echo "ci.yml hasn't passed on $GITHUB_SHA; re-run this job once it has."
+            exit 1
+          fi
+
+  publish:
+    name: Publish to GitHub Packages
+    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          registry-url: https://npm.pkg.github.com
+          scope: '@botfoodai'
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - run: wasm-pack build wasm --release --target web --scope botfoodai
+      - name: Smoke test the built package
+        run: node --test wasm/test.mjs
+      # GitHub Packages links the package to the repository its package.json names.
+      - name: Set the fork's version and repository
+        working-directory: wasm/pkg
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: npm pkg set "version=$VERSION" "repository.url=git+https://github.com/$GITHUB_REPOSITORY.git"
+      # npm requires a dist-tag for prerelease versions; every fork version is
+      # one, and the newest should be what a bare install gets.
+      - run: npm publish --tag latest
+        working-directory: wasm/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
